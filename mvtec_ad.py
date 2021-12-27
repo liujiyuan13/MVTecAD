@@ -9,6 +9,7 @@ import os
 from PIL import Image
 from torchvision.datasets import VisionDataset
 from torchvision.datasets.utils import download_and_extract_archive
+from torchvision.datasets.folder import is_image_file
 
 from typing import Optional, Callable, List, Tuple, Dict, Any
 
@@ -30,10 +31,14 @@ class MVTecAD(VisionDataset):
         download (bool, optional): If true, downloads the dataset from the internet and
             puts it in root directory. If dataset is already downloaded, it is not
             downloaded again.
+        pin_memory (bool, optional): If true, load all images into memory in this class.
+            Otherwise, only image paths are kept.
      Attributes:
         subset_name (str): name of the loaded subset.
         classes (list): List of the class names sorted alphabetically.
         class_to_idx (dict): Dict with items (class_name, class_index).
+        image_paths (list): List of image paths.
+        mask_paths (list): List of mask paths.
         data (list): List of PIL images. not named with 'images' for consistence with common dataset, such as cifar.
         masks (list): List of PIL masks. mask is of the same size of image and indicate the anomaly pixels.
         targets (list): The class_index value for each image in the dataset.
@@ -64,10 +69,7 @@ class MVTecAD(VisionDataset):
         'zipper': 'https://www.mydrive.ch/shares/38536/3830184030e49fe74747669442f0f282/download/420938385-1629953449/zipper.tar.xz'
     }
 
-    # supported image extensions
-    image_exts = ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')
-
-    # string definition specified to MVTec-AD dataset
+    # definition specified to MVTec-AD dataset
     dataset_name = next(iter(data_dict.keys()))
     subset_names = list(subset_dict.keys())
     normal_str = 'good'
@@ -75,6 +77,7 @@ class MVTecAD(VisionDataset):
     train_str = 'train'
     test_str = 'test'
     compress_ext = '.tar.xz'
+    image_size = (900, 900)
 
     def __init__(self,
                  root,
@@ -83,13 +86,16 @@ class MVTecAD(VisionDataset):
                  transform: Optional[Callable] = None,
                  target_transform: Optional[Callable] = None,
                  mask_transform: Optional[Callable] = None,
-                 download=True):
+                 download=True,
+                 pin_memory=False):
 
         super(MVTecAD, self).__init__(root, transform=transform,
                                       target_transform=target_transform)
 
         self.train = train
         self.mask_transform = mask_transform
+        self.download = download
+        self.pin_memory = pin_memory
 
         # path
         self.dataset_root = os.path.join(self.root, self.dataset_name)
@@ -97,8 +103,8 @@ class MVTecAD(VisionDataset):
         self.subset_root = os.path.join(self.dataset_root, self.subset_name)
         self.subset_split = os.path.join(self.subset_root, self.train_str if self.train else self.test_str)
 
-        if download is True:
-            self.download()
+        if self.download is True:
+            self.download_subset()
 
         if not os.path.exists(self.subset_root):
             raise FileNotFoundError('subset {} is not found, please set download=True to download it.')
@@ -106,10 +112,15 @@ class MVTecAD(VisionDataset):
         # get image classes and corresponding targets
         self.classes, self.class_to_idx = self._find_classes(self.subset_split)
 
-        # get images, masks and targets
-        self.data, self.masks, self.targets = self._load_data(self.subset_split, self.class_to_idx, self.image_exts)
+        # get image paths, mask paths and targets
+        self.image_paths, self.mask_paths, self.targets = self._find_paths(self.subset_split, self.class_to_idx)
         if self.__len__() == 0:
             raise FileNotFoundError("found 0 files in {}\n".format(self.subset_split))
+
+        # pin memory (usually used for small datasets)
+        if self.pin_memory:
+            self.data = self._load_images('RGB', self.image_paths)
+            self.masks = self._load_images('L', self.mask_paths)
 
     def __getitem__(self, idx: int) -> Tuple[Any, Any, Any]:
         '''
@@ -118,7 +129,11 @@ class MVTecAD(VisionDataset):
         :return: (tuple): (image, mask, target) where target is index of the target class.
         '''
         # get image, mask and target of idx
-        image, mask, target = self.data[idx], self.masks[idx], self.targets[idx]
+        if self.pin_memory:
+            image, mask = self.data[idx], self.masks[idx]
+        else:
+            image, mask = self._pil_loader('RGB', self.image_paths[idx]), self._pil_loader('L', self.mask_paths[idx])
+        target = self.targets[idx]
 
         # apply transform
         if self.transform is not None:
@@ -137,7 +152,7 @@ class MVTecAD(VisionDataset):
         split = self.train_str if self.train else self.test_str
         return 'using data: {data}\nsplit: {split}'.format(data=self.subset_name, split=split)
 
-    def download(self):
+    def download_subset(self):
         '''
         download the subset
         :return:
@@ -173,45 +188,78 @@ class MVTecAD(VisionDataset):
         class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
         return classes, class_to_idx
 
-    def _load_data(self,
-                   folder: str,
-                   class_to_idx: Dict[str, int],
-                   image_exts: Optional[Tuple[str, ...]]) -> Tuple[Any, Any, Any]:
+    def _find_paths(self,
+                    folder: str,
+                    class_to_idx: Dict[str, int]) -> Tuple[Any, Any, Any]:
         '''
-        load images, masks and corresponding targets.
+        find image paths, mask paths and corresponding targets
         :param folder: folder/class_0/*.*
                        folder/class_1/*.*
         :param class_to_idx: dict of class name and corresponding label
-        :param image_exts: file extensions, such as .png
-        :return: (images, masks, targets), they are np.array()
+        :return: image paths, mask paths, targets
         '''
-        # data to load
-        data, masks, targets = [], [], []
+        # define variables to fill
+        image_paths, mask_paths, targets = [], [], []
 
-        # load data
+        # define path find helper
+        def find_mask_from_image(target_class, image_path):
+            '''
+            find mask path according to image path
+            :param target_class: target class
+            :param image_path: image path
+            :return: None or mask path
+            '''
+            if target_class is self.normal_str:
+                mask_path = None
+            else:
+                # only test data have mask images
+                mask_path = image_path.replace(self.test_str, self.mask_str)
+                fext = '.' + fname.split('.')[-1]
+                mask_path = mask_path.replace(fext, '_mask' + fext)
+            return mask_path
+
+        # find
         for target_class in class_to_idx.keys():
             class_idx = class_to_idx[target_class]
             target_folder = os.path.join(folder, target_class)
             for root, _, fnames in sorted(os.walk(target_folder, followlinks=True)):
                 for fname in fnames:
-                    fext = '.' + fname.split('.')[-1]
-                    if fext in image_exts:
+                    if is_image_file(fname):
                         # get image
-                        image_path = os.path.join(root, fname)
-                        data.append(Image.open(image_path))
+                        image_paths.append(os.path.join(root, fname))
                         # get mask
-                        if target_class is self.normal_str:
-                            masks.append(Image.new('L', data[-1].size))
-                        else:
-                            # only test data have mask images
-                            mask_path = image_path.replace(self.test_str, self.mask_str)
-                            mask_path = mask_path.replace(fext, '_mask'+fext)
-                            masks.append(Image.open(mask_path))
+                        mask_paths.append(find_mask_from_image(target_class, image_paths[-1]))
                         # get target
                         targets.append(class_idx)
 
-        # # transform to numpy.Array
-        # data, masks = np.stack(data, axis=0), np.stack(masks, axis=0)
-        # targets = np.array(targets)
+        return image_paths, mask_paths, targets
 
-        return data, masks, targets
+    def _pil_loader(self, mode: str, path: str):
+        '''
+        load PIL image according to path.
+        :param mode: PIL option, 'RGB' or 'L'
+        :param path: image path, None refers to create a new image
+        :return: PIL image
+        '''
+        if path is None:
+            image = Image.new(mode, size=self.image_size)
+        else:
+            # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+            # !!! directly using Image.open(mode, path) will lead to Dataloader Error inside loop !!!
+            with open(path, 'rb') as f:
+                image = Image.open(f)
+                image = image.convert(mode)
+        return image
+
+    def _load_images(self, mode: str, paths: List[str]) -> List[Any]:
+        '''
+        load images according to paths.
+        :param mode: PIL option, 'RGB' or 'L'
+        :param paths: paths of images to load
+        :return: list of images
+        '''
+        images = []
+        for path in paths:
+            images.append(self._pil_loader(mode, path))
+        return images
+
